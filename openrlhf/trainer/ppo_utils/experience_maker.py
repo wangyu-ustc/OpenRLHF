@@ -1,3 +1,4 @@
+import sys
 import time
 from abc import ABC
 from copy import deepcopy
@@ -113,7 +114,7 @@ class Samples:
     packed_seq_lens: Optional[torch.Tensor]
     response_length: torch.Tensor
     total_length: torch.Tensor
-
+    answers: Optional[List[str]] = None
 
 class NaiveExperienceMaker(ABC):
     """
@@ -132,6 +133,7 @@ class NaiveExperienceMaker(ABC):
         strategy=None,
         remote_rm_url: str = None,
         reward_fn=None,
+        rule_based_reward: bool = False,
     ) -> None:
         super().__init__()
         self.actor = actor
@@ -145,6 +147,7 @@ class NaiveExperienceMaker(ABC):
         self.strategy = strategy
         self.reward_fn = reward_fn
         self.perf_stats = None
+        self.rule_based_reward = rule_based_reward
         self.advantage_estimator = strategy.args.advantage_estimator
 
     # tokenizer
@@ -178,6 +181,7 @@ class NaiveExperienceMaker(ABC):
         """
         args = self.strategy.args
         # generate responses
+
         samples_list = self.generate_samples(all_prompts, **generate_kwargs)
         torch.distributed.barrier()
 
@@ -196,6 +200,9 @@ class NaiveExperienceMaker(ABC):
             experience = experience.to_device("cuda")
             reward = reward.to(device="cuda")
             num_actions = experience.info["num_actions"]
+
+            print("reward before compute reward:", reward[:10])
+
             reward = compute_reward(
                 reward,
                 self.kl_ctl.value,
@@ -204,6 +211,9 @@ class NaiveExperienceMaker(ABC):
                 num_actions=num_actions,
                 reward_clip_range=args.reward_clip_range,
             )
+
+            print("reward after compute reward:", reward[0][:10])
+            print("advantage_estimator", self.advantage_estimator)
 
             if self.advantage_estimator == "gae":
                 experience.advantages, experience.returns = self.get_advantages_and_returns(
@@ -222,6 +232,8 @@ class NaiveExperienceMaker(ABC):
                 experience.advantages = deepcopy(experience.returns)
             else:
                 raise Exception(f"Unkown advantage_estimator {self.advantage_estimator}")
+
+            print("experience.advantages:", experience.advantages[0][:10])
 
             # calculate the return info.
             if not getattr(self, "packing_samples", False):
@@ -245,6 +257,14 @@ class NaiveExperienceMaker(ABC):
         assert not getattr(self, "packing_samples", False)
         args = self.strategy.args
         self.actor.eval()
+
+        if isinstance(all_prompts[0], list):
+            assert self.rule_based_reward
+            all_answers = all_prompts[1]
+            all_prompts = all_prompts[0]
+        else:
+            all_answers = None
+
         # sample multiple response
         all_prompts = sum([[prompt] * args.n_samples_per_prompt for prompt in all_prompts], [])
         samples_list = []
@@ -260,6 +280,7 @@ class NaiveExperienceMaker(ABC):
                 packed_seq_lens=None,
                 response_length=action_mask.float().sum(dim=-1),
                 total_length=attention_mask.float().sum(dim=-1),
+                answers=all_answers[i : i + args.micro_rollout_batch_size] if all_answers else None,
             )
             samples_list.append(samples)
         return samples_list
@@ -300,8 +321,46 @@ class NaiveExperienceMaker(ABC):
             queries = self.tokenizer.batch_decode(sequences.cpu(), skip_special_tokens=False)
             r = remote_rm_fn(self.remote_rm_url, queries=queries).to(device=action_log_probs.device)
         else:
-            # local RM
-            r = self.reward_model(sequences, attention_mask)
+
+            if self.rule_based_reward:
+                answers = samples.answers
+
+                if self.packing_samples:
+                    # NOTE: concat all outputs to following format:
+                    #
+                    # | token token token | token token [EOS] | token token token token token | token token [EOS] | token token | token token token [EOS] |
+                    # |<---  prompt ----->|<---- answer ----->|<---------- prompt ----------->|<----- answer ---->|<- prompt -->|<-------- answer ------->|
+                    packed_seq_lens = samples.packed_seq_lens
+                    packed_sequences = []
+                    offset = 0
+                    for length in packed_seq_lens:
+                        packed_sequences.append(sequences.cpu()[0, offset : offset + length])
+                        offset += length
+                    queries = self.tokenizer.batch_decode(packed_sequences, skip_special_tokens=False)
+                    preds = [x.split("</eval>")[-1].strip() if '</eval>' in x else 'error' for x in queries]
+
+                else:
+                    queries = self.tokenizer.batch_decode(sequences.cpu(), skip_special_tokens=False)
+                    preds = [x.split("</eval>")[-1].strip() for x in queries]
+                
+                r = []
+                for answer, pred in zip(answers, preds):
+                    if answer == 'model_a':
+                        if '[[A]]' in pred:
+                            r.append(torch.tensor([1.0]))
+                        else:
+                            r.append(torch.tensor([-1.0]))
+                    elif answer == 'model_b':
+                        if '[[B]]' in pred:
+                            r.append(torch.tensor([1.0]))
+                        else:
+                            r.append(torch.tensor([-1.0]))
+                r = torch.cat(r).to(device=action_log_probs.device).to(action_log_probs.dtype)
+
+            else:
+                # local RM
+                r = self.reward_model(sequences, attention_mask)
+                # tensor([-2.8594, -0.1465, -2.3594,  0.2031], device='cuda:0', dtype=torch.bfloat16)
 
         kl = compute_approx_kl(
             action_log_probs,
@@ -457,7 +516,6 @@ class NaiveExperienceMaker(ABC):
 
         return returns
 
-
 class RemoteExperienceMaker(NaiveExperienceMaker):
     def __init__(self, *args, vllm_engines: List = None, packing_samples=False, **kwargs):
         super().__init__(*args, **kwargs)
@@ -540,8 +598,88 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         r_refs = []
         # support remote RM API with ray
         if not self.remote_rm_url:
-            for rm in self.reward_model:
-                r_refs.append(rm.forward.remote(sequences_cpu, attention_mask_cpu, packed_seq_lens=packed_seq_lens))
+            
+            if self.rule_based_reward:
+                
+                answers = samples.answers
+
+                if self.packing_samples:
+                    # NOTE: concat all outputs to following format:
+                    #
+                    # | token token token | token token [EOS] | token token token token token | token token [EOS] | token token | token token token [EOS] |
+                    # |<---  prompt ----->|<---- answer ----->|<---------- prompt ----------->|<----- answer ---->|<- prompt -->|<-------- answer ------->|
+                    
+                    packed_seq_lens = samples.packed_seq_lens 
+                    packed_sequences = []
+                    offset = 0
+                    for length in packed_seq_lens:
+                        packed_sequences.append(sequences.cpu()[0, offset : offset + length])
+                        offset += length
+                    queries = self.tokenizer.batch_decode(packed_sequences, skip_special_tokens=True)
+                    preds = [x[-20:] for x in queries]
+                
+                else:
+                    queries = self.tokenizer.batch_decode(sequences_cpu, skip_special_tokens=False)
+                    preds = [x[-20:] for x in queries]
+                
+                r = []
+
+                print("answer:", answers)
+                print("preds:", preds)
+
+                for answer, pred in zip(answers, preds):
+                    
+                    if answer in ['yes', 'no']:
+
+                        if answer == 'yes':
+                            if 'yes' in pred:
+                                r.append(torch.tensor([1.0]))
+                            else:
+                                r.append(torch.tensor([-1.0]))
+                        else:
+                            if 'no' in pred:
+                                r.append(torch.tensor([1.0]))
+                            else:
+                                r.append(torch.tensor([-1.0]))
+
+                    else:
+
+                        if answer == 'model_a':
+                            if '[[A]]' in pred:
+                                r.append(torch.tensor([1.0]))
+                            else:
+                                r.append(torch.tensor([-1.0]))
+                        elif answer == 'model_b':
+                            if '[[B]]' in pred:
+                                r.append(torch.tensor([1.0]))
+                            else:
+                                r.append(torch.tensor([-1.0]))
+                        else:
+                            if '[[Tie]]' in pred:
+                                r.append(torch.tensor([1.0]))
+                            else:
+                                r.append(torch.tensor([-1.0]))
+                    
+                # print("preds:", preds)
+                # print("answers:", answers)
+                # print("r:", r)
+                # r = torch.cat(r).to(device=action_log_probs.device).to(action_log_probs.dtype)
+                r = torch.cat(r)
+
+                print("rewards:", r)
+                print("mean of rewards:", r.mean())
+                print("std of rewards:", r.std())
+
+                # normalize the rewards
+                # r = (r - r.mean()) / (r.std() + 1e-8)
+                # print("rewards after normalize:", r)
+
+                r_refs.append(ray.put(r))
+
+            else:
+                for rm in self.reward_model:
+                    r_refs.append(rm.forward.remote(sequences_cpu, attention_mask_cpu, packed_seq_lens=packed_seq_lens))
+
         else:
             # remote RM
             if not self.packing_samples:
@@ -573,6 +711,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         if value is not None:
             value = value.to(device)
         rewards = [r.to(device) for r in rewards]
+
         r = self.reward_fn(rewards) if len(rewards) > 0 else rewards[0]
 
         # avoid CUDA OOM when colocate models
@@ -655,6 +794,13 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             include_stop_str_in_output=True,
         )
 
+        if isinstance(all_prompts[0], list):
+            assert self.rule_based_reward
+            all_answers = all_prompts[1]
+            all_prompts = all_prompts[0]
+        else:
+            all_answers = None
+
         # Expand prompt list based on the number of samples per prompt
         all_prompts = sum([[prompt] * args.n_samples_per_prompt for prompt in all_prompts], [])
         all_prompt_token_ids = self.tokenize_fn(all_prompts, self.prompt_max_len, padding=False)["input_ids"]
@@ -708,6 +854,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                 sequences = sequences.to("cuda")
                 attention_mask = attention_mask.to("cuda")
                 action_mask = action_mask.to("cuda")
+
                 samples_list.append(
                     Samples(
                         sequences=sequences,
@@ -717,9 +864,12 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                         packed_seq_lens=None,
                         response_length=action_mask.float().sum(dim=-1),
                         total_length=attention_mask.float().sum(dim=-1),
+                        answers=all_answers[i : i + args.micro_rollout_batch_size] if all_answers else None,
                     )
                 )
+
             else:
+
                 # NOTE: concat all outputs to following format:
                 #
                 # | token token token | token token [EOS] | token token token token token | token token [EOS] | token token | token token token [EOS] |
@@ -745,6 +895,21 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                 action_mask = None
                 response_length = torch.tensor(num_actions, device="cuda", dtype=torch.float)
                 total_length = torch.tensor(packed_seq_lens, device="cuda", dtype=torch.float)
+
+                # TODO: use assistant start token to split the sequences
+
+                # print("Sequences:", [len(x) for x in sequences])
+                # # extract sequences from sequences[0] with packed_seq_lens
+                # packed_sequences = []
+                # offset = 0
+                # for length in packed_seq_lens:
+                #     packed_sequences.append(sequences.cpu()[0, offset : offset + length])
+                #     offset += length
+                # queries = self.tokenizer.batch_decode(packed_sequences, skip_special_tokens=True)
+                # print("queries after split:", queries)
+                # preds = [x[-10:] for x in queries]
+                # print("preds:", preds)
+
                 samples_list.append(
                     Samples(
                         sequences=sequences,
@@ -754,8 +919,10 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                         packed_seq_lens=packed_seq_lens,
                         response_length=response_length,
                         total_length=total_length,
+                        answers=all_answers[i : i + args.micro_rollout_batch_size] if all_answers else None,
                     )
                 )
+
         return samples_list
 
     def flush(self):

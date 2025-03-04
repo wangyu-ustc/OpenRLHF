@@ -3,6 +3,23 @@ from tqdm import tqdm
 
 
 def preprocess_data(data, input_template=None, input_key="input", apply_chat_template=None) -> str:
+
+    if ',' in input_key:
+        input_keys = input_key.split(',')
+        prompts = []
+        for key in input_keys:
+            if apply_chat_template and key != 'winner' and key != 'labels':
+                chat = data[key]
+                if isinstance(chat, str):
+                    chat = [{"role": "user", "content": chat}]
+                prompt = apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+            else:
+                prompt = data[key]
+                if input_template:
+                    prompt = input_template.format(prompt)
+            prompts.append(prompt)
+        return prompts
+
     if apply_chat_template:
         chat = data[input_key]
         if isinstance(chat, str):

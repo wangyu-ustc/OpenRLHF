@@ -8,7 +8,7 @@ import torch
 from transformers.trainer import get_scheduler
 
 from openrlhf.datasets import PromptDataset, SFTDataset
-from openrlhf.models import Actor, get_llm_for_sequence_regression
+from openrlhf.models import Actor, get_llm_for_sequence_regression, get_llm_for_generative_rm
 from openrlhf.trainer import PPOTrainer
 from openrlhf.utils import blending_datasets, get_strategy, get_tokenizer
 
@@ -54,8 +54,9 @@ def train(args):
     else:
         critic = None
 
-    if not args.remote_rm_url:
-        reward_model = get_llm_for_sequence_regression(
+    if args.generative_rm:
+
+        reward_model = get_llm_for_generative_rm(
             args.reward_pretrain,
             "reward",
             normalize_reward=args.normalize_reward,
@@ -65,8 +66,22 @@ def train(args):
             ds_config=strategy.get_ds_train_config(is_actor=False),
             value_head_prefix=args.value_head_prefix,
         )
+    
     else:
-        reward_model = None
+
+        if not args.remote_rm_url and not args.rule_based_reward:
+            reward_model = get_llm_for_sequence_regression(
+                args.reward_pretrain,
+                "reward",
+                normalize_reward=args.normalize_reward,
+                use_flash_attention_2=args.flash_attn,
+                bf16=args.bf16,
+                load_in_4bit=args.load_in_4bit,
+                ds_config=strategy.get_ds_train_config(is_actor=False),
+                value_head_prefix=args.value_head_prefix,
+            )
+        else:
+            reward_model = None
 
     strategy.print("reward normalization status: {}".format(args.normalize_reward))
     if reward_model:
@@ -130,6 +145,7 @@ def train(args):
         train_split=args.prompt_split,
     )
     prompts_data = prompts_data.select(range(min(args.max_samples, len(prompts_data))))
+
     prompts_dataset = PromptDataset(prompts_data, tokenizer, strategy, input_template=args.input_template)
 
     if args.pretrain_data:
@@ -262,6 +278,7 @@ def train(args):
         eos_token_id=tokenizer.eos_token_id,
         # remote reward model
         remote_rm_url=args.remote_rm_url,
+        rule_based_reward=args.rule_based_reward,
         save_hf_ckpt=args.save_hf_ckpt,
         disable_ds_ckpt=args.disable_ds_ckpt,
     )
@@ -357,6 +374,10 @@ if __name__ == "__main__":
     parser.add_argument("--gradient_checkpointing_use_reentrant", action="store_true", default=False)
     parser.add_argument("--disable_fast_tokenizer", action="store_true", default=False)
 
+    # parameters for generative reward model
+    parser.add_argument("--generative_rm", action='store_true', default=False)
+    parser.add_argument('--rule_based_reward', action='store_true', default=False)
+
     # Reinforce
     parser.add_argument(
         "--advantage_estimator",
@@ -419,13 +440,14 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    if args.advantage_estimator not in ["gae"]:
-        args.critic_pretrain = None
-    elif args.critic_pretrain is None:
-        if not args.remote_rm_url:
-            args.critic_pretrain = args.reward_pretrain
-        else:
-            args.critic_pretrain = args.pretrain
+    # if args.advantage_estimator not in ["gae"]:
+    #     args.critic_pretrain = None
+    # elif args.critic_pretrain is None:
+    #     if not args.remote_rm_url:
+    #         args.critic_pretrain = args.reward_pretrain
+    #     else:
+    #         args.critic_pretrain = args.pretrain
+    args.critic_pretrain = None
 
     if args.advantage_estimator == "rloo":
         assert args.n_samples_per_prompt > 1, "RLOO requires n_samples_per_prompt > 1"

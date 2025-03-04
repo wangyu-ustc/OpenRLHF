@@ -17,6 +17,43 @@ from .utils import reset_position_ids
 logger = init_logger(__name__)
 
 
+def get_llm_for_generative_rm(
+    model_name_or_path: str,
+    model_type: str,
+    *,
+    bf16=True,
+    load_in_4bit=False,
+    lora_rank=0,
+    lora_alpha=16,
+    target_modules=None,
+    lora_dropout=0,
+    normalize_reward=False,
+    use_flash_attention_2=False,
+    ds_config: dict = None,
+    init_value_head: bool = False,
+    value_head_prefix="score",
+    device_map=None,
+    packing_samples=False,
+    **kwargs,
+) -> nn.Module:
+    
+    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+    config.normalize_reward = normalize_reward
+    config._attn_implementation = "flash_attention_2" if use_flash_attention_2 else "eager"
+
+    # Prioritize using the value_head_prefix in the model configuration.
+    value_head_prefix = getattr(config, "value_head_prefix", value_head_prefix)
+    logger.info(f"set value_head_prefix to `{value_head_prefix}`")
+
+    base_class = AutoModel._model_mapping[type(config)]
+    base_pretrained_class = base_class.__base__
+
+    # define a generative reward model here that takes text as input
+    reward_model = None
+
+    return reward_model
+
+
 # Construct transformer with a value head for sequence classification.
 # https://github.com/huggingface/transformers/blob/405b56269812056d9593869e22b7b264d806cb1e/src/transformers/models/llama/modeling_llama.py#L1254
 def get_llm_for_sequence_regression(

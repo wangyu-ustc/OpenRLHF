@@ -11,7 +11,7 @@ from .loss import (
     ValueLoss,
     VanillaKTOLoss,
 )
-from .model import get_llm_for_sequence_regression
+from .model import get_llm_for_sequence_regression, get_llm_for_generative_rm
 
 __all__ = [
     "Actor",
@@ -26,4 +26,5 @@ __all__ = [
     "ValueLoss",
     "VanillaKTOLoss",
     "get_llm_for_sequence_regression",
+    "get_llm_for_generative_rm"
 ]

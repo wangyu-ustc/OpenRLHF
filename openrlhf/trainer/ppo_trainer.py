@@ -86,6 +86,7 @@ class PPOTrainer(ABC):
         dataloader_pin_memory: bool = True,
         remote_rm_url: str = None,
         reward_fn: Callable[[List[torch.Tensor]], torch.Tensor] = None,
+        rule_based_reward: bool = False,
         save_hf_ckpt: bool = False,
         disable_ds_ckpt: bool = False,
         **generate_kwargs,
@@ -149,6 +150,7 @@ class PPOTrainer(ABC):
             strategy,
             remote_rm_url,
             reward_fn,
+            rule_based_reward,
         )
         packing_samples = getattr(self.args, "packing_samples", False)
         self.replay_buffer = NaiveReplayBuffer(

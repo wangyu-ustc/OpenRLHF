@@ -115,7 +115,8 @@ def train(args):
         critic_model = None
 
     # multiple reward models
-    if not args.remote_rm_url:
+    if not args.remote_rm_url and not args.rule_based_reward:
+
         reward_pretrains = args.reward_pretrain.split(",")
         reward_models = []
         for _ in reward_pretrains:
@@ -135,7 +136,7 @@ def train(args):
     refs = []
     refs.extend(ref_model.async_init_model_from_pretrained(strategy, args.pretrain))
     refs.extend(actor_model.async_init_model_from_pretrained(strategy, args.pretrain))
-    if not args.remote_rm_url:
+    if not args.remote_rm_url and not args.rule_based_reward:
         for reward_model, reward_pretrain in zip(reward_models, reward_pretrains):
             refs.extend(reward_model.async_init_model_from_pretrained(strategy, reward_pretrain))
 
@@ -164,7 +165,7 @@ def train(args):
 
     # train actor and critic mdoel
     refs = actor_model.async_fit_actor_model(
-        critic_model, ref_model, reward_models, args.remote_rm_url, reward_fn=reward_fn, vllm_engines=vllm_engines
+        critic_model, ref_model, reward_models, args.remote_rm_url, args.rule_based_reward, reward_fn=reward_fn, vllm_engines=vllm_engines
     )
     ray.get(refs)
 
@@ -316,6 +317,7 @@ if __name__ == "__main__":
     parser.add_argument("--critic_pretrain", type=str, default=None, help="HF model name or path")
     parser.add_argument("--value_head_prefix", type=str, default="score")
     parser.add_argument("--ref_reward_offload", action="store_true", default=False)
+    parser.add_argument('--rule_based_reward', action='store_true', default=False)
 
     # Custom dataset
     parser.add_argument("--prompt_data", type=str, default=None, help="HF dataset name or path")
